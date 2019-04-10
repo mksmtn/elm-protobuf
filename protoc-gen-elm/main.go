@@ -113,11 +113,14 @@ func main() {
 			log.Printf("Skipping well known type")
 			continue
 		}
-		outFile, err := processFile(inFile)
+		elmOutFile, jsOutFile, err := processFile(inFile)
 		if err != nil {
 			log.Fatalf("Could not process file: %v", err)
 		}
-		resp.File = append(resp.File, outFile)
+		resp.File = append(resp.File, elmOutFile)
+		if jsOutFile != nil {
+			resp.File = append(resp.File, jsOutFile)
+		}
 	}
 
 	data, err = proto.Marshal(resp)
@@ -155,12 +158,16 @@ func hasMapEntriesInMessage(inMessage *descriptor.DescriptorProto) bool {
 	return false
 }
 
-func processFile(inFile *descriptor.FileDescriptorProto) (*plugin.CodeGeneratorResponse_File, error) {
+func processFile(inFile *descriptor.FileDescriptorProto) (*plugin.CodeGeneratorResponse_File, *plugin.CodeGeneratorResponse_File, error) {
+	// TODO use args
+	shouldGeneratePorts := true
+
 	if inFile.GetSyntax() != "proto3" {
-		return nil, fmt.Errorf("Only proto3 syntax is supported")
+		return nil, nil, fmt.Errorf("Only proto3 syntax is supported")
 	}
 
-	outFile := &plugin.CodeGeneratorResponse_File{}
+	elmOutFile := &plugin.CodeGeneratorResponse_File{}
+	var jsOutFile *plugin.CodeGeneratorResponse_File
 
 	inFilePath := inFile.GetName()
 	inFileDir, inFileName := filepath.Split(inFilePath)
@@ -168,23 +175,23 @@ func processFile(inFile *descriptor.FileDescriptorProto) (*plugin.CodeGeneratorR
 	shortModuleName := firstUpper(strings.TrimSuffix(inFileName, ".proto"))
 
 	fullModuleName := ""
-	outFileName := ""
+	elmOutFileName := ""
 	for _, segment := range strings.Split(inFileDir, "/") {
 		if segment == "" {
 			continue
 		}
 		fullModuleName += firstUpper(segment) + "."
-		outFileName += firstUpper(segment) + "/"
+		elmOutFileName += firstUpper(segment) + "/"
 	}
 	fullModuleName += shortModuleName
-	outFileName += shortModuleName + ".elm"
+	elmOutFileName += shortModuleName + ".elm"
 
-	outFile.Name = proto.String(outFileName)
+	elmOutFile.Name = proto.String(elmOutFileName)
 
 	b := &bytes.Buffer{}
 	fg := NewFileGenerator(b, inFileName)
 
-	fg.GenerateModule(fullModuleName)
+	fg.GenerateModule(fullModuleName, shouldGeneratePorts)
 	fg.GenerateComments(inFile)
 
 	fg.GenerateBaseImports()
@@ -216,23 +223,46 @@ func processFile(inFile *descriptor.FileDescriptorProto) (*plugin.CodeGeneratorR
 
 	var err error
 
+	// ports
+	if (shouldGeneratePorts) {
+		jsOutFile = &plugin.CodeGeneratorResponse_File{}
+		jsFileName := elmOutFileName + ".js"
+		jsOutFile.Name = proto.String(jsFileName)
+		jsB := &bytes.Buffer{}
+		jsFg := NewFileGenerator(jsB, jsFileName)
+
+		err = fg.GenerateElmPorts("", inFile)
+
+		if err != nil {
+			return nil, nil, err
+		}
+
+		err = jsFg.GenerateJsPorts("", inFile)
+
+		if err != nil {
+			return nil, nil, err
+		}
+
+		jsOutFile.Content = proto.String(jsB.String())
+	}
+
 	// Top-level enums.
 	for _, inEnum := range inFile.GetEnumType() {
 		typeToFile[strings.TrimPrefix(inFile.GetPackage()+"."+inEnum.GetName(), ".")] = inFile.GetName()
 
 		err = fg.GenerateEnumDefinition("", inEnum)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		err = fg.GenerateEnumDecoder("", inEnum)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		err = fg.GenerateEnumEncoder("", inEnum)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -242,17 +272,22 @@ func processFile(inFile *descriptor.FileDescriptorProto) (*plugin.CodeGeneratorR
 
 		err = fg.GenerateEverything("", inMessage)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	outFile.Content = proto.String(b.String())
+	elmOutFile.Content = proto.String(b.String())
 
-	return outFile, nil
+	return elmOutFile, jsOutFile, nil
 }
 
-func (fg *FileGenerator) GenerateModule(moduleName string) {
-	fg.P("module %s exposing (..)", moduleName)
+func (fg *FileGenerator) GenerateModule(moduleName string, shouldGeneratePorts bool) {
+	prefix := ""
+	if shouldGeneratePorts {
+		prefix += "port "
+	}
+	s := prefix + "module %s exposing (..)"
+	fg.P(s, moduleName)
 }
 
 func (fg *FileGenerator) GenerateComments(inFile *descriptor.FileDescriptorProto) {
